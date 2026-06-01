@@ -77,7 +77,7 @@ Specify a comma-separated list of fields as the first positional argument:
 | `perf-all-metrics` | All three perf metrics in one segment |
 | `input` | Cumulative input tokens |
 | `output` | Cumulative output tokens |
-| `tokens` | **Live** context window usage (same basis as Claude Code's auto-compact watcher) |
+| `tokens` | **Live** context window usage — reads `context_window.total_input_tokens` from Claude Code's stdin JSON (CC v2.1.132+); falls back to transcript for older versions |
 | `compact-remaining` | Tokens until auto-compact triggers |
 | `cost` | Session cost in USD |
 | `newline` | Line break (splits output across two lines) |
@@ -152,8 +152,9 @@ Additional `PYCCSL_*` variables that mirror the CLI flags (useful in `settings.j
 pyccsl replicates Claude Code's compaction formula exactly:
 
 ```
-effective_window = min(CLAUDE_CODE_AUTO_COMPACT_WINDOW, --context-window)
-                   # if CLAUDE_CODE_AUTO_COMPACT_WINDOW is 0/unset → use --context-window
+effective_window = min(CLAUDE_CODE_AUTO_COMPACT_WINDOW, context_window_size)
+                   # context_window_size = model's full window from stdin (e.g. 200000 or 1000000)
+                   # if CLAUDE_CODE_AUTO_COMPACT_WINDOW is 0/unset → use context_window_size
 
 default_threshold = effective_window - compact_buffer   # buffer default: 13000
 
@@ -164,17 +165,31 @@ if CLAUDE_AUTOCOMPACT_PCT_OVERRIDE is set:
 compact_remaining = max(0, threshold - live_context_tokens)
 ```
 
-The `tokens` field and the `compact_remaining` counter both use **live context** (the last turn's input + prompt cache tokens), matching the value Claude Code itself watches.
+`live_context_tokens` comes from `context_window.total_input_tokens` in Claude Code's stdin JSON
+(CC v2.1.132+), falling back to transcript reconstruction for older versions.
 
-**Example** with `CLAUDE_CODE_AUTO_COMPACT_WINDOW=750000`, `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80`, `--context-window 1000000`:
-- `effective_window = min(750000, 1000000) = 750000`
-- `default_threshold = 750000 - 13000 = 737000`
-- `threshold = min(floor(750000 × 0.80), 737000) = min(600000, 737000) = 600000`
-- If current context = 98200 tokens → `compact_remaining = 600000 - 98200 = 501800`
+**Important:** `context_window.used_percentage` in the stdin JSON always reflects
+`total_input_tokens / context_window_size` (model's full window), not relative to
+`CLAUDE_CODE_AUTO_COMPACT_WINDOW`. When `CLAUDE_CODE_AUTO_COMPACT_WINDOW` is smaller than the
+model window, the compact fires below 100 × pct % — pyccsl uses `total_input_tokens` directly
+rather than deriving context from `used_percentage` to avoid this ambiguity.
+
+**Example** with `CLAUDE_CODE_AUTO_COMPACT_WINDOW=500000`, `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80`, 1M model:
+- `effective_window = min(500000, 1000000) = 500000`
+- `default_threshold = 500000 - 13000 = 487000`
+- `threshold = min(floor(500000 × 0.80), 487000) = min(400000, 487000) = 400000`
+- If current context = 98200 tokens → `compact_remaining = 400000 - 98200 = 301800`
 
 ## Input Format
 
-pyccsl reads a JSON object from stdin. Claude Code passes this automatically when `statusLine.type` is `"command"`. The JSON contains the session transcript path, model info, usage stats, and git context.
+pyccsl reads a JSON object from stdin. Claude Code passes this automatically when `statusLine.type` is `"command"`. The JSON contains the session transcript path, model info, usage stats, and git context. Relevant fields for context math:
+
+| Field | Description |
+|---|---|
+| `context_window.total_input_tokens` | Live context size in tokens (= `current_usage` sum). Used for `Tok` and `Cmpct`. |
+| `context_window.context_window_size` | Model's actual window: 200000 (standard) or 1000000 (extended context). Not affected by `CLAUDE_CODE_AUTO_COMPACT_WINDOW`. |
+| `context_window.used_percentage` | `total_input_tokens / context_window_size × 100`. Useful for display; pyccsl does not use it for compact math. |
+| `context_window.current_usage` | Per-component breakdown (input, cache_creation, cache_read). Sum always equals `total_input_tokens`. |
 
 ## License
 

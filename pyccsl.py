@@ -21,7 +21,7 @@ import sys
 from datetime import datetime
 from typing import Any
 
-__version__ = "0.9.41"
+__version__ = "0.9.42"
 
 # Pricing data embedded from https://docs.anthropic.com/en/docs/about-claude/pricing
 # All prices in USD per million tokens
@@ -708,6 +708,50 @@ def extract_workspace_info(input_data: dict[str, Any]) -> dict[str, Any]:
         workspace_info["project_dir"] = None
 
     return workspace_info
+
+
+def extract_context_window(input_data: dict[str, Any]) -> dict[str, Any]:
+    """Extract context-window metrics from the context_window object in stdin.
+
+    Claude Code v2.1.132+ sends current-turn token counts directly (not cumulative).
+    Returns all-None when the object is absent or null (older CC / manual stdin).
+
+    Returned keys:
+      current_context: input + cache_read + cache_creation tokens (int or None)
+      window_size:     model context window in tokens (int or None)
+      used_percentage: pre-calculated % of window used (float or None)
+    """
+    result: dict[str, int | float | None] = {
+        "current_context": None,
+        "window_size": None,
+        "used_percentage": None,
+    }
+    cw = input_data.get("context_window")
+    if not isinstance(cw, dict):
+        return result
+
+    # current_context: prefer current_usage (explicit field breakdown, version-stable);
+    # fall back to total_input_tokens (pre-summed, same arithmetic).
+    usage = cw.get("current_usage")
+    if isinstance(usage, dict):
+        inp = usage.get("input_tokens") or 0
+        cr = usage.get("cache_read_input_tokens") or 0
+        cc = usage.get("cache_creation_input_tokens") or 0
+        result["current_context"] = inp + cr + cc
+    else:
+        total = cw.get("total_input_tokens")
+        if isinstance(total, int) and total >= 0:
+            result["current_context"] = total
+
+    ws = cw.get("context_window_size")
+    if isinstance(ws, int) and ws > 0:
+        result["window_size"] = ws
+
+    pct = cw.get("used_percentage")
+    if isinstance(pct, (int, float)):
+        result["used_percentage"] = float(pct)
+
+    return result
 
 
 def extract_git_status(input_data: dict[str, Any]) -> dict[str, Any]:
@@ -1728,14 +1772,27 @@ def main() -> int:
     transcript_path = input_data.get("transcript_path", None)
     transcript_entries = load_transcript(transcript_path, debug=debug)
 
+    # Extract authoritative context-window data from stdin (CC v2.1.132+).
+    cw_info = extract_context_window(input_data)
+    if debug:
+        sys.stderr.write(f"DEBUG: Stdin context_window: {cw_info}\n")
+
     # Auto-detect context window from model ID when --context-window is 0.
+    # Prefer stdin's context_window_size (directly from CC) over model-ID prefix lookup.
     if config["context_window"] == 0:
-        mid = model_info.get("id") or get_model_from_transcript(transcript_entries)
-        config["context_window"] = get_model_context_window(mid)
-        if debug:
-            sys.stderr.write(
-                f"DEBUG: Auto-detected context_window={config['context_window']} from model={mid!r}\n"
-            )
+        if cw_info["window_size"]:
+            config["context_window"] = cw_info["window_size"]
+            if debug:
+                sys.stderr.write(
+                    f"DEBUG: context_window={config['context_window']} (source: stdin context_window_size)\n"
+                )
+        else:
+            mid = model_info.get("id") or get_model_from_transcript(transcript_entries)
+            config["context_window"] = get_model_context_window(mid)
+            if debug:
+                sys.stderr.write(
+                    f"DEBUG: context_window={config['context_window']} (source: model-ID lookup, model={mid!r})\n"
+                )
 
     # Calculate metrics from transcript
     metrics = {}
@@ -1746,54 +1803,12 @@ def main() -> int:
         )
 
     if transcript_entries:
-        # Calculate token usage
+        # Calculate token usage (cumulative session totals for input/output/cache fields)
         token_totals = calculate_token_usage(transcript_entries)
         metrics.update(token_totals)
 
         if debug:
             sys.stderr.write(f"DEBUG: Token totals: {token_totals}\n")
-
-        current_ctx = get_current_context_size(transcript_entries)
-        metrics["current_context_size"] = current_ctx
-
-        # Derive the auto-compact threshold using the same formula as Claude Code
-        # (code.claude.com/docs/en/env-vars, anthropics/claude-code issue #31806):
-        #
-        #   effective_window = min(CLAUDE_CODE_AUTO_COMPACT_WINDOW, model_window)
-        #   default_threshold = effective_window - reserved_buffer
-        #   if pct set:
-        #       threshold = min(floor(effective_window * pct/100), default_threshold)
-        #   else:
-        #       threshold = default_threshold
-        #
-        # The Math.min clamp mirrors Claude Code: CLAUDE_AUTOCOMPACT_PCT_OVERRIDE
-        # can only LOWER the trigger, never raise it above (window − buffer).
-        model_window = config["context_window"]
-        acw = config.get("auto_compact_window", 0)
-        effective_window = min(acw, model_window) if acw > 0 else model_window
-        reserved_buffer = config.get("compact_buffer", 13000)
-        default_threshold = max(0, effective_window - reserved_buffer)
-
-        if config.get("compact_threshold", 0) > 0:
-            # Explicit absolute override wins over everything else
-            compact_threshold = config["compact_threshold"]
-        elif config.get("compact_pct", 0) > 0:
-            # Percentage path: clamped so it can only lower the default threshold
-            compact_threshold = min(
-                int(effective_window * config["compact_pct"] / 100),
-                default_threshold,
-            )
-        else:
-            # No pct set → Claude Code default (effective window minus response buffer)
-            compact_threshold = default_threshold
-
-        if debug:
-            sys.stderr.write(
-                f"DEBUG: compact_threshold={compact_threshold} "
-                f"(effective_window={effective_window}, pct={config.get('compact_pct')}, "
-                f"buffer={reserved_buffer}, model_window={model_window})\n"
-            )
-        metrics["compact_remaining"] = max(0, compact_threshold - current_ctx)
 
         # Calculate cost (unless disabled or on Max plan)
         if not config.get("no_cost", False):
@@ -1842,6 +1857,66 @@ def main() -> int:
             sys.stderr.write(
                 "DEBUG: Badge not created - cache_hit_rate not in metrics\n"
             )
+
+    # Current context size — prefer stdin (authoritative, same basis CC uses for its %
+    # indicator), fall back to transcript reconstruction for older CC / manual testing.
+    # Works with or without a transcript, so Tok and Cmpct render even in stdin-only runs.
+    if cw_info["current_context"] is not None:
+        current_ctx: int | None = cw_info["current_context"]
+        if debug:
+            sys.stderr.write(
+                f"DEBUG: current_context_size={current_ctx} (source: stdin context_window)\n"
+            )
+    elif transcript_entries:
+        current_ctx = get_current_context_size(transcript_entries)
+        if debug:
+            sys.stderr.write(
+                f"DEBUG: current_context_size={current_ctx} (source: transcript)\n"
+            )
+    else:
+        current_ctx = None
+
+    if current_ctx is not None:
+        metrics["current_context_size"] = current_ctx
+
+        # Derive the auto-compact threshold using the same formula as Claude Code
+        # (code.claude.com/docs/en/env-vars):
+        #
+        #   effective_window = min(CLAUDE_CODE_AUTO_COMPACT_WINDOW, model_window)
+        #   default_threshold = effective_window - reserved_buffer
+        #   if pct set:
+        #       threshold = min(floor(effective_window * pct/100), default_threshold)
+        #   else:
+        #       threshold = default_threshold
+        #
+        # The Math.min clamp mirrors Claude Code: CLAUDE_AUTOCOMPACT_PCT_OVERRIDE
+        # can only LOWER the trigger, never raise it above (window − buffer).
+        model_window = config["context_window"]
+        acw = config.get("auto_compact_window", 0)
+        effective_window = min(acw, model_window) if acw > 0 else model_window
+        reserved_buffer = config.get("compact_buffer", 13000)
+        default_threshold = max(0, effective_window - reserved_buffer)
+
+        if config.get("compact_threshold", 0) > 0:
+            # Explicit absolute override wins over everything else
+            compact_threshold = config["compact_threshold"]
+        elif config.get("compact_pct", 0) > 0:
+            # Percentage path: clamped so it can only lower the default threshold
+            compact_threshold = min(
+                int(effective_window * config["compact_pct"] / 100),
+                default_threshold,
+            )
+        else:
+            # No pct set → Claude Code default (effective window minus response buffer)
+            compact_threshold = default_threshold
+
+        if debug:
+            sys.stderr.write(
+                f"DEBUG: compact_threshold={compact_threshold} "
+                f"(effective_window={effective_window}, pct={config.get('compact_pct')}, "
+                f"buffer={reserved_buffer}, model_window={model_window})\n"
+            )
+        metrics["compact_remaining"] = max(0, compact_threshold - current_ctx)
 
     # Add git info to metrics
     if git_info["branch"]:
