@@ -21,7 +21,7 @@ import sys
 from datetime import datetime
 from typing import Any
 
-__version__ = "0.9.40"
+__version__ = "0.9.41"
 
 # Pricing data embedded from https://docs.anthropic.com/en/docs/about-claude/pricing
 # All prices in USD per million tokens
@@ -98,6 +98,30 @@ PRICING_DATA = {
         "cache_read": 0.03,
         "output": 1.25,
     },
+}
+
+# Default context window per model-ID prefix (tokens).
+# Newer Claude 4.x models (Opus 4.8, Sonnet 4.6+) ship with 1M context natively.
+# Older Claude 4.x (Opus 4, Sonnet 4) and all Claude 3.x use 200K.
+# Override with --context-window if needed (e.g. restricted API tiers).
+MODEL_CONTEXT_WINDOWS: dict[str, int] = {
+    # Claude 4.x with 1M context (check Anthropic docs for new model IDs)
+    "claude-opus-4-8": 1_000_000,
+    "claude-opus-4-7": 1_000_000,
+    "claude-opus-4-6": 1_000_000,
+    "claude-opus-4-5": 1_000_000,
+    "claude-sonnet-4-6": 1_000_000,
+    "claude-sonnet-4-7": 1_000_000,
+    "claude-sonnet-4-8": 1_000_000,
+    # Claude 4.x legacy (200K)
+    "claude-opus-4-": 200_000,
+    "claude-sonnet-4-": 200_000,
+    # Claude 4.x Haiku (200K)
+    "claude-haiku-4-": 200_000,
+    # Claude 3.x — all 200K
+    "claude-3-7-": 200_000,
+    "claude-3-5-": 200_000,
+    "claude-3-": 200_000,
 }
 
 # Theme definitions - 256-color ANSI codes
@@ -424,12 +448,14 @@ def parse_arguments() -> dict[str, Any]:
         "When > 0, overrides all other compact-threshold settings.",
     )
 
-    # Context window size (combined with --compact-pct to derive the threshold)
+    # Context window size (combined with --compact-pct to derive the threshold).
+    # 0 = auto-detect from the model ID in the transcript (recommended).
+    # Pass an explicit value only for extended-context sessions (e.g. 1000000).
     parser.add_argument(
         "--context-window",
         type=int,
-        default=int(os.environ.get("PYCCSL_CONTEXT_WINDOW", "200000")),
-        help="Model context window in tokens (default: 200000; use 1000000 for 1M-context models)",
+        default=int(os.environ.get("PYCCSL_CONTEXT_WINDOW", "0")),
+        help="Model context window in tokens (0 = auto-detect from model ID; use 1000000 for extended-context sessions)",
     )
 
     # Auto-compact percentage - kept in sync with Claude Code's global
@@ -745,6 +771,20 @@ def get_model_pricing(model_id: str | None) -> dict[str, Any] | None:
     if model_id and model_id in PRICING_DATA:
         return PRICING_DATA[model_id]
     return None
+
+
+def get_model_context_window(model_id: str | None) -> int:
+    """Return the default context window (tokens) for a model ID using prefix matching.
+
+    Returns 200_000 if the model is unknown — correct for all current Claude models
+    in standard context mode.  Extended-context sessions must pass --context-window
+    explicitly.
+    """
+    if model_id:
+        for prefix, window in MODEL_CONTEXT_WINDOWS.items():
+            if model_id.startswith(prefix):
+                return window
+    return 200_000
 
 
 def load_transcript(
@@ -1687,6 +1727,15 @@ def main() -> int:
     # Load transcript if provided
     transcript_path = input_data.get("transcript_path", None)
     transcript_entries = load_transcript(transcript_path, debug=debug)
+
+    # Auto-detect context window from model ID when --context-window is 0.
+    if config["context_window"] == 0:
+        mid = model_info.get("id") or get_model_from_transcript(transcript_entries)
+        config["context_window"] = get_model_context_window(mid)
+        if debug:
+            sys.stderr.write(
+                f"DEBUG: Auto-detected context_window={config['context_window']} from model={mid!r}\n"
+            )
 
     # Calculate metrics from transcript
     metrics = {}
