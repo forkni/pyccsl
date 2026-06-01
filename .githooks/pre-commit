@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# Pre-commit hook — blocks local-only files from being committed.
+# Part of claude-git-workflow. Sources _common.sh at run time so changes
+# to CGW_LOCAL_FILES in .cgw.conf take effect without re-running configure.sh.
+
+set -uo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+# shellcheck source=scripts/git/_common.sh
+source "${REPO_ROOT}/scripts/git/_common.sh"
+
+echo "Checking for local-only files..."
+
+mapfile -t PROBLEMATIC_FILES < <(
+  git diff --cached --name-only --diff-filter=AM | cgw_filter_local_files || true
+)
+
+if (( ${#PROBLEMATIC_FILES[@]} > 0 )); then
+  echo "ERROR: Attempting to add or modify local-only files!"
+  echo ""
+  echo "The following files must remain local only:"
+  printf '  %s\n' "${PROBLEMATIC_FILES[@]}"
+  echo ""
+  echo "DELETIONS are allowed (removing from git tracking)"
+  echo "ADDITIONS/MODIFICATIONS are blocked"
+  echo ""
+  echo "To fix: git reset HEAD <file>"
+  echo ""
+  exit 1
+fi
+
+mapfile -t DELETED_FILES < <(
+  git diff --cached --name-only --diff-filter=D | cgw_filter_local_files || true
+)
+if (( ${#DELETED_FILES[@]} > 0 )); then
+  echo "  Local-only files being removed from git tracking (allowed)"
+fi
+
+echo "  No local-only files detected"
+
+# Optional: lint check for staged files using CGW_LINT_CMD (non-blocking)
+STAGED_FILES=$(git diff --cached --name-only --diff-filter=ACM)
+
+if [[ -n "${STAGED_FILES}" ]] && [[ -n "${CGW_LINT_CMD:-}" ]]; then
+  echo ""
+  echo "Checking lint (non-blocking)..."
+  logfile=/dev/null
+  # shellcheck disable=SC2086  # STAGED_FILES intentionally word-split into separate file args
+  if cgw_run_lint_check ${STAGED_FILES} >/dev/null 2>&1; then
+    echo "  [PASS] Lint check passed"
+  else
+    echo "  [WARN] Lint issues found in staged files"
+    echo "  Run './scripts/git/fix_lint.sh --modified-only' to auto-fix"
+    echo "  (Commit proceeds — fix lint before pushing)"
+  fi
+fi
+
+# Optional: typecheck using CGW_TYPECHECK_CMD (non-blocking)
+if [[ -n "${STAGED_FILES}" ]] && [[ -n "${CGW_TYPECHECK_CMD:-}" ]] && [[ "${CGW_SKIP_TYPECHECK:-0}" != "1" ]]; then
+  echo ""
+  echo "Checking types (non-blocking)..."
+  logfile=/dev/null
+  if cgw_run_typecheck >/dev/null 2>&1; then
+    echo "  [PASS] Typecheck passed"
+  else
+    echo "  [WARN] Type errors found"
+    echo "  Run '${CGW_TYPECHECK_CMD} ${CGW_TYPECHECK_CHECK_ARGS:-check}' to see details"
+    echo "  (Commit proceeds — fix types before pushing)"
+  fi
+fi
+
+echo ""
+exit 0
