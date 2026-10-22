@@ -191,6 +191,22 @@ pyccsl reads a JSON object from stdin. Claude Code passes this automatically whe
 | `context_window.used_percentage` | `total_input_tokens / context_window_size × 100`. Useful for display; pyccsl does not use it for compact math. |
 | `context_window.current_usage` | Per-component breakdown (input, cache_creation, cache_read). Sum always equals `total_input_tokens`. |
 
-## License
+## License, provenance and trademarks
 
-MIT — see [LICENSE](LICENSE).
+**License.** pyccsl is released under the [MIT License](LICENSE).
+Copyright (c) 2025-2026 Alexander Korneev.
+
+**AI-assisted authorship.** Parts of this project's code and documentation were drafted
+with the help of Claude Code, an AI coding assistant. The author reviewed, edited,
+tested, selected and arranged that material and is responsible for it. No copyright is
+claimed over raw, unedited AI output.
+
+**Contributions.** Under
+[GitHub's Terms of Service, section D.6](https://docs.github.com/en/site-policy/github-terms/github-terms-of-service#6-contributions-under-repository-license),
+anything you contribute to this repository is licensed to the project and its users
+under the repository's MIT License ("inbound = outbound"). No separate contributor
+agreement or sign-off is required.
+
+**Trademarks.** Claude and Claude Code are trademarks of Anthropic, PBC. These names are
+used only to identify the software pyccsl works with. pyccsl is an independent project
+and is not affiliated with, sponsored by or endorsed by Anthropic.

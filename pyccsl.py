@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Alexander Korneev
+# SPDX-License-Identifier: MIT
 """
 pyccsl - Python Claude Code Status Line
 Generates a customizable status line for Claude Code showing performance metrics,
